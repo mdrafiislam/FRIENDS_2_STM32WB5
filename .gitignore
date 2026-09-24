@@ -1,0 +1,77 @@
+# ---------------------------------------------------------------------------
+# Hardware design and project configuration are intentionally NOT published.
+# ---------------------------------------------------------------------------
+
+# Schematics, datasheets, design notes, presentations
+*.pdf
+*.docx
+*.doc
+*.pptx
+*.xlsx
+*.sch
+*.SchDoc
+*.PcbDoc
+*.brd
+*.kicad_*
+Gerber*/
+gerber*/
+schematic*
+Schematic*
+
+# STM32CubeMX / CubeIDE project and configuration files
+*.ioc
+.mxproject
+.project
+.cproject
+.settings/
+*.launch
+*.ld
+
+# Archives (may contain any of the above)
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+
+# Vendor code (ST HAL, CMSIS, middleware, startup) - available from ST
+Drivers/
+Middlewares/
+Utilities/
+Core/Startup/
+
+# Internal notes and AI assistant context
+CLAUDE.md
+AGENTS.md
+.claude/
+Claude outputs/
+
+# Host tools, captured data
+*.py
+*.csv
+__pycache__/
+requirements.txt
+
+# Build output
+Debug/
+Release/
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.o
+*.d
+*.su
+*.cyclo
+
+# Backups, editor and OS noise
+Backup/
+*.bak
+.vscode/
+.metadata/
+Thumbs.db
+Desktop.ini
+*.swp
+*.tmp
+*.log
