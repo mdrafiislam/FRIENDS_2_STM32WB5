@@ -22,7 +22,7 @@ schematics, and the CubeMX/CubeIDE project configuration are not included.
   host can read the SD card, and back again on eject (`usb_mode.c`).
 - **BLE streaming** - STM32_WPAN stack on CPU2, GATT notifications of sensor
   samples at 20 Hz, ATT MTU exchange on connect for full-size packets.
-- **USB DFU from software** - a `b` command closes files, detaches USB, sets a
+- **USB DFU from software** - a `boot` command closes files, detaches USB, sets a
   flag in an RTC backup register and resets; the next boot jumps to the ST
   system bootloader before any clock or peripheral init (`boot_dfu.c`).
 - **Dual-core clock ownership fix** - USB 48 MHz clock is claimed through a
@@ -43,7 +43,7 @@ schematics, and the CubeMX/CubeIDE project configuration are not included.
 ## Serial commands (USB CDC)
 
 `d` start logging, `s` stop logging, `e` switch USB to mass storage,
-`b` enter USB DFU, `p`/`m`/`v` start streaming, `x` stop streaming,
+`boot` enter USB DFU, `p`/`m`/`v` start streaming, `x` stop streaming,
 `z` re-zero the magnetometer difference.
 
 ## Tools

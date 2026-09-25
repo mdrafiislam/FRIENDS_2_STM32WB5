@@ -31,7 +31,7 @@
 #include "diskio.h"
 #include "p2p_server_app.h" // BLE notify functions
 #include "mag_zero.h"       // boot-time zeroing of the s1 - s2 vector difference
-#include "boot_dfu.h"       // 'b' command: software entry into the USB DFU bootloader
+#include "boot_dfu.h"       // 'boot' command: software entry into the USB DFU bootloader
 #include "usbd_core.h"      // USBD_Stop/USBD_DeInit for a clean detach before DFU
 /* USER CODE END Includes */
 
@@ -259,6 +259,7 @@ static void SDLog_Start(void);
 static void SDLog_Stop(const char *reason);
 static void SDLog_Eject(void);
 static void Cmd_EnterBootloader(void);
+static uint8_t Cmd_IsWord(const char *text, const char *word);
 static void SDLog_Abort(const char *operration, FRESULT result);
 
 static void SDLog_WriteSample(uint32_t now_ms,
@@ -294,7 +295,9 @@ static void PuffLogService(void);
 static void testLeds(void);
 static void testRF_status(void);
 static void getTimestamp(char *buf, size_t len);
-static void LED_IdlePurple(void);
+static void LED_AllOff(void);
+static void LED_PuffOn(void);
+static void LED_BootBlink(void);
 
 /* Thermistor Read Helpers */
 static uint16_t Thermistor_ReadChannel(uint32_t channel, GPIO_TypeDef *en_port, uint16_t en_pin);
@@ -423,15 +426,9 @@ int main(void)
   MagZero_Arm();
   mag_zero_announced = 0U;
 
-  if ((id1 == LIS2MDL_WHO_AM_I) && (id2 == LIS2MDL_WHO_AM_I)) {
-    HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin, GPIO_PIN_SET);
-  } else {
-    HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
-  }
-
-
-  // After both sensor initialization
-  LED_IdlePurple();
+  // Startup indication, then idle: all LEDs off. Green comes on only while a puff is active.
+  LED_BootBlink();
+  LED_AllOff();
   /* USER CODE END 2 */
 
   /* Init code for STM32_WPAN */
@@ -1168,6 +1165,9 @@ static void MX_GPIO_Init(void)
       SD_CS_GPIO_Port,
       SD_CS_Pin,
       GPIO_PIN_SET);
+
+  /* LEDs are active-low; the generated init above drives them low (on). */
+  LED_AllOff();
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
@@ -1304,7 +1304,12 @@ static void SDLog_ProcessCommand(void)
         SDLog_Eject();
         break;
     case 'b':
-        Cmd_EnterBootloader();   /* does not return unless cancelled */
+        /* Full word only, so a stray 'b' cannot drop the board into DFU. */
+        if (Cmd_IsWord(p, "boot") != 0U) {
+            Cmd_EnterBootloader();   /* does not return unless cancelled */
+        } else {
+            (void)USB_CDC_Print("Send 'boot' to enter the USB DFU bootloader\r\n");
+        }
         break;
     case 'p':
         serial_stream_mode = STREAM_FULL;
@@ -1350,7 +1355,7 @@ static void SDLog_ProcessCommand(void)
         (void)USB_CDC_Print("Unknown command. Use d=start, s=stop, e=eject, "
                             "p=print full, m=print magnitudes, v=print signed "
                             "vector, x=stop print, z=zero mag delta, "
-                            "b=USB DFU bootloader\r\n");
+                            "boot=USB DFU bootloader\r\n");
         break;
 
     }
@@ -1637,11 +1642,29 @@ static void SDLog_Eject(void)
     if (USB_Device_SwitchToMSC() == 0U) {(void)USB_CDC_Print("USB mass storage switch failed; CDC restored");}
 }
 
-/* 'b' command: close SD files, detach USB cleanly, then reset into the ST
+/* 'boot' command: close SD files, detach USB cleanly, then reset into the ST
  * system-memory bootloader (USB DFU). The actual flag + reset + jump live in
  * boot_dfu.c (user-owned). Mirrors SDLog_Eject's close-then-print-then-wait
  * pattern and USB_Device_SwitchToMSC's Stop/DeInit/delay detach timing, both
  * of which are already proven on this board. */
+/* Returns 1 if text is word (case-insensitive), followed only by whitespace. */
+static uint8_t Cmd_IsWord(const char *text, const char *word)
+{
+    while (*word != '\0') {
+        if (tolower((unsigned char)*text) != *word) {
+            return 0U;
+        }
+        text++;
+        word++;
+    }
+
+    while ((*text != '\0') && isspace((unsigned char)*text)) {
+        text++;
+    }
+
+    return (*text == '\0') ? 1U : 0U;
+}
+
 static void Cmd_EnterBootloader(void)
 {
     sd_faulted = 0U;
@@ -1908,10 +1931,7 @@ static void start_puff(void)
     puff_start_rising_count = rf_rising_count;
     puff_start_falling_count = rf_falling_count;
 
-    // Unset purple and turn green
-    HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin, GPIO_PIN_RESET);
+    LED_PuffOn();
     char message[96];
     int len = snprintf(
         message,
@@ -1952,8 +1972,7 @@ static void end_puff(void)
     uint32_t falling = rf_falling_count - puff_start_falling_count;
 
     puff_ended = 1U;
-    // unset green and return to purple
-    if (puff_ended == 1U) { LED_IdlePurple(); }
+    LED_AllOff();
 
     /* Writing for both CDC and SD Logging */
     char message[128];
@@ -2066,11 +2085,42 @@ static void Thermistor_ReadBoth(uint16_t *t1_raw, uint16_t *t2_raw)
 	if (t2_raw != NULL) { *t2_raw = v2; }
 }
 
-static void LED_IdlePurple(void)
+/* The RGB LED is active-low: GPIO_PIN_RESET lights a colour, GPIO_PIN_SET turns it off. */
+static void LED_AllOff(void)
+{
+	HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin, GPIO_PIN_SET);
+	HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin, GPIO_PIN_SET);
+}
+
+static void LED_PuffOn(void)
 {
 	HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
 	HAL_GPIO_WritePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin, GPIO_PIN_SET);
 	HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin, GPIO_PIN_RESET);
+}
+
+/* Boot sequence: red, green, blue, purple (red + blue), 250 ms each, then all off. */
+static void LED_BootBlink(void)
+{
+	LED_AllOff();
+	HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_RESET);
+	HAL_Delay(250U);
+
+	LED_AllOff();
+	HAL_GPIO_WritePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin, GPIO_PIN_RESET);
+	HAL_Delay(250U);
+
+	LED_AllOff();
+	HAL_GPIO_WritePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin, GPIO_PIN_RESET);
+	HAL_Delay(250U);
+
+	LED_AllOff();
+	HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_RESET);
+	HAL_GPIO_WritePin(LED_BLUE_GPIO_Port, LED_BLUE_Pin, GPIO_PIN_RESET);
+	HAL_Delay(250U);
+
+	LED_AllOff();
 }
 
 static void getTimestamp(char *buf, size_t len)

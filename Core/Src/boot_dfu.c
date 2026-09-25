@@ -41,7 +41,7 @@
   * SystemInit() has already cleared LSI1ON/LSI2ON so RTCCLK is stopped.
   * RM0434 §34 states the register survives system reset but does not state
   * whether an APB read needs RTCCLK running. Observable: if this assumption is
-  * wrong, 'b' simply reboots into the application instead of DFU.
+  * wrong, 'boot' simply reboots into the application instead of DFU.
   *
   * ASSUMPTION: the STM32WB5MMG module die runs the same bootloader as the
   * STM32WB55xx entry in AN2606 §81 (ID 0xD5 at 0x1FFF6FFE). Confirm once by
