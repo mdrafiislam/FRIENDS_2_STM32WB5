@@ -9,19 +9,22 @@ schematics, and the CubeMX/CubeIDE project configuration are not included.
 ## Highlights
 
 - **Dual magnetometer acquisition** - two LIS2MDL sensors over SPI at 20 Hz,
-  with per-sensor magnitude, a differential vector that cancels the Earth's
-  field, and boot-time baseline zeroing (`mag_zero.c`).
-- **Event detection with a timer input capture** - TIM2 PWM-input mode measures
-  period and duty cycle of an external signal in the ISR, with running-mean
-  hysteresis detection. The ISR only sets flags; SD and USB work is deferred to
-  the main loop.
+  paired by data-ready in a free-running main loop (no fixed delay), with
+  per-sensor magnitude, a differential vector that cancels the Earth's field,
+  and boot-time baseline zeroing (`mag_zero.c`).
+- **Event detection with timer capture/compare** - TIM2 in PWM-input mode
+  (slave reset on each rising edge) starts an event on the first capture and
+  measures its duration by summing captured periods (15.6 ns resolution). A
+  CH3 output compare fires when no edge arrives within a timeout and ends the
+  event. The ISR drives the status LED and pushes events into a lock-free
+  single-producer/single-consumer queue; SD and USB work stays in the main loop.
 - **SD card logging** - FatFs over SPI with a custom disk I/O layer
   (`sd_spi_diskio.c`), paired CSV run files, periodic sync, and safe close.
 - **USB composite behaviour at runtime** - boots as a CDC virtual COM port for
   commands and streaming, then switches to USB Mass Storage on command so the
   host can read the SD card, and back again on eject (`usb_mode.c`).
-- **BLE streaming** - STM32_WPAN stack on CPU2, GATT notifications of sensor
-  samples at 20 Hz, ATT MTU exchange on connect for full-size packets.
+- **BLE streaming** - STM32_WPAN stack on CPU2, one GATT notification per new
+  sensor sample pair, ATT MTU exchange on connect for full-size packets.
 - **USB DFU from software** - a `boot` command closes files, detaches USB, sets a
   flag in an RTC backup register and resets; the next boot jumps to the ST
   system bootloader before any clock or peripheral init (`boot_dfu.c`).

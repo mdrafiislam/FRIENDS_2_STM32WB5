@@ -80,6 +80,13 @@ static SerialStreamMode serial_stream_mode = STREAM_OFF;
 
 static uint32_t usb_status_last_ms = 0U;
 
+/* The main loop is not paced, so HAL_BUSY ("no new sample yet") is the normal
+ * LIS2MDL_ReadXYZ result on most passes. Only a part that has been HAL_BUSY for
+ * longer than this is reported on CDC as a read fault. 200 ms is four sample
+ * periods at the 20 Hz ODR (CFG_REG_A ODR[1:0]=01, LIS2MDL DS12144 Rev 6
+ * Table 24), so it cannot trip on normal inter-sample gaps. */
+#define LIS2MDL_BUSY_REPORT_MS 200U
+
 /* Mag-delta zeroing. mag_zero_announced gates the one-shot CDC report so the
  * baseline is printed exactly once per capture rather than every loop pass. */
 static uint8_t mag_zero_announced = 0U;
@@ -88,7 +95,7 @@ static uint8_t mag_zero_announced = 0U;
 static FATFS sd_fs;
 static FIL sd_puff_file;
 static FIL sd_mag_file;
-static uint32_t current_puff_id = 0U;
+static volatile uint32_t current_puff_id = 0U; /* last ID handed out; written by the TIM2 ISR and SDLog_Start() */
 static uint8_t sd_faulted = 0U;
 static uint8_t sd_mounted = 0U;
 static uint8_t sd_logging = 0U;
@@ -123,13 +130,10 @@ static uint8_t mag_buffer_ready = 0U;
 static uint8_t mag_overrun = 0U;
 
 // Puff Detection Variables
+// Puff start, end and duration are decided in hardware and the TIM2 interrupt:
+// CH1 capture starts the puff and times it, CH3 compare ends it. The main loop
+// only logs the queued events (see PuffLogService).
 volatile uint8_t puff_active = 0U;
-volatile uint8_t puff_started = 0U;
-volatile uint8_t puff_ended = 0U;
-volatile uint32_t puff_start_ms = 0U;
-volatile uint32_t puff_end_ms = 0U;
-volatile uint32_t puff_duration_ms = 0U;
-volatile uint32_t last_rf_edge_ms = 0U;
 volatile uint32_t rf_edge_count = 0U;
 volatile uint32_t rf_rising_count = 0U;
 volatile uint32_t rf_falling_count = 0U;
@@ -150,14 +154,46 @@ volatile uint32_t rf_duty_max = 0U;
 volatile int32_t rf_duty_acc = 0;
 volatile uint32_t rf_duty_cross = 0U;
 volatile uint8_t rf_duty_state = 0U;
-// 0 idle, 1 skip first cycle, 2 seed the mean, 3 collecting
+// 0 idle, 2 seed the mean, 3 collecting
 volatile uint8_t rf_meas_state = 0U;
 
-static uint32_t puff_start_edge_count = 0U;
-static uint32_t puff_start_rising_count = 0U;
-static uint32_t puff_start_falling_count = 0U;
+/* The puff ends when no rising edge arrives for this long. Shorter splits a
+ * puff sooner; longer delays the end (and the LED) by the same amount. The
+ * logged duration never includes it. */
+#define RF_END_TIMEOUT_US 10000U
 
-#define RF_INACTIVITY_TIMEOUT_MS 1000U
+static uint32_t rf_ticks_per_us = 64U;     /* TIM2 clock in MHz, set in MX_TIM2_Init */
+static uint32_t rf_end_timeout_ticks = 0U; /* RF_END_TIMEOUT_US in TIM2 ticks = CCR3 */
+static uint64_t rf_dur_ticks = 0U;         /* first rising edge -> latest rising edge */
+static uint32_t rf_puff_start_ms = 0U;
+static volatile uint32_t rf_puff_id = 0U;  /* ID of the current (or most recent) puff, fixed at its first edge */
+static uint32_t rf_puff_start_edges = 0U;
+static uint32_t rf_puff_start_rising = 0U;
+static uint32_t rf_puff_start_falling = 0U;
+
+/* Puff events, produced by the TIM2 interrupt and consumed by the main loop.
+ * Single producer / single consumer, so no lock is needed. Each END event
+ * carries a snapshot of that puff's statistics, so several short puffs can
+ * queue up between two main loop passes without mixing their numbers. */
+#define RF_EVT_START 0U
+#define RF_EVT_END   1U
+#define RF_EVT_QUEUE_LEN 16U
+
+typedef struct {
+	uint8_t  type;
+	uint32_t puff_id;
+	uint32_t start_ms;        /* HAL_GetTick() at the first rising edge */
+	uint64_t duration_ticks;  /* TIM2 ticks, first rising edge -> last rising edge */
+	uint32_t edges, rising, falling;
+	uint32_t per_min, per_max, gap_count;
+	uint32_t duty_min, duty_max, duty_cross;
+	uint32_t overcapture, latency_max;
+} RfPuffEvent;
+
+static RfPuffEvent rf_evt_queue[RF_EVT_QUEUE_LEN];
+static volatile uint32_t rf_evt_head = 0U;    /* written by the ISR only */
+static volatile uint32_t rf_evt_tail = 0U;    /* written by the main loop only */
+static volatile uint32_t rf_evt_dropped = 0U; /* events lost to a full queue */
 
 /* Thermistor Variables*/
 // Mirroring the old MSP design: each divider is powered by
@@ -267,6 +303,7 @@ static void SDLog_WriteSample(uint32_t now_ms,
     int16_t s2_x, int16_t s2_y, int16_t s2_z, uint32_t s2_mag,
     int16_t z_x, int16_t z_y, int16_t z_z, uint32_t z_mag);
 static void SDLog_WritePuffEvent(
+		uint32_t puff_id,
 		const char *event,
 		uint32_t start_ms,
 		uint32_t end_ms,
@@ -275,7 +312,8 @@ static void SDLog_WritePuffEvent(
 		uint32_t rising,
 		uint32_t falling,
 		uint32_t t1_raw,
-		uint32_t t2_raw);
+		uint32_t t2_raw,
+		uint32_t duration_us);
 
 static FRESULT SDLog_Mount(void);
 
@@ -289,9 +327,12 @@ static void SDLog_PrintResult(const char *operation, FRESULT result);
 static HAL_StatusTypeDef USB_CDC_Print(const char *text);
 
 /* Puff Operations */
-static void start_puff(void);
-static void end_puff(void);
 static void PuffLogService(void);
+static void RF_PuffStart(uint32_t now_ms);  /* TIM2 ISR context */
+static void RF_PuffEnd(void);               /* TIM2 ISR context */
+static void RF_QueuePush(uint8_t type);     /* TIM2 ISR context */
+static void Puff_LogStart(const RfPuffEvent *ev);
+static void Puff_LogEnd(const RfPuffEvent *ev);
 static void testLeds(void);
 static void testRF_status(void);
 static void getTimestamp(char *buf, size_t len);
@@ -460,15 +501,22 @@ int main(void)
     }
     SDLog_ProcessCommand(); // continually checks for commands typed over serial
 
-    /* Reads both sensors */
+    /* Reads both sensors. LIS2MDL_ReadXYZ writes x1..z2 only when it returns
+     * HAL_OK, so these globals always hold each part's most recent sample. */
     HAL_StatusTypeDef s1 = LIS2MDL_ReadXYZ((int16_t *)&x1, (int16_t *)&sensor1_y, (int16_t *)&z1, CS1_Select, CS1_Deselect);
     HAL_StatusTypeDef s2 = LIS2MDL_ReadXYZ((int16_t *)&x2, (int16_t *)&y2, (int16_t *)&z2, CS2_Select, CS2_Deselect);
 
-    /* LIS2MDL_ReadXYZ returns HAL_BUSY to mean "no new sample yet", not an SPI
-     * error. Brief HAL_BUSY is normal - this loop polls at 20 Hz and the ODR is
-     * also 20 Hz, so we sometimes ask a hair early. Sustained HAL_BUSY means the
-     * part has fallen out of continuous mode, so re-init instead of requiring a
-     * reflash. Everything downstream is gated on both reads being HAL_OK. */
+    /* Set when either part returned an SPI error, or has been HAL_BUSY for
+     * longer than LIS2MDL_BUSY_REPORT_MS. Drives the rate-limited CDC status
+     * line below. */
+    uint8_t mag_read_fault = 0U;
+
+    /* LIS2MDL_ReadXYZ returns HAL_BUSY to mean "no new sample yet" (STATUS_REG
+     * Zyxda = 0, LIS2MDL DS12144 Rev 6 section 8.12), not an SPI error. The
+     * loop is not paced, so it polls much faster than the 20 Hz ODR and
+     * HAL_BUSY is the normal result on most passes. Sustained HAL_BUSY means
+     * the part has fallen out of continuous mode, so re-init instead of
+     * requiring a reflash. */
     {
       static uint32_t s1_busy_since = 0U, s2_busy_since = 0U;
       uint32_t busy_now = HAL_GetTick();
@@ -499,11 +547,37 @@ int main(void)
           }
         }
       } else { s2_busy_since = 0U; }
+
+      if (((s1 != HAL_OK) && (s1 != HAL_BUSY)) ||
+          ((s2 != HAL_OK) && (s2 != HAL_BUSY)) ||
+          ((s1_busy_since != 0U) && ((uint32_t)(busy_now - s1_busy_since) > LIS2MDL_BUSY_REPORT_MS)) ||
+          ((s2_busy_since != 0U) && ((uint32_t)(busy_now - s2_busy_since) > LIS2MDL_BUSY_REPORT_MS))) {
+        mag_read_fault = 1U;
+      }
     }
 
-    if ((s1 == HAL_OK) && (s2 == HAL_OK))
+    /* Pairing. The two parts free-run on separate internal clocks, so with an
+     * unpaced loop their new samples arrive on different passes: requiring both
+     * reads to be HAL_OK in the same pass would almost never succeed. Instead,
+     * latch "new sample seen" per part and process one pair once both have
+     * delivered since the last pair. A part that delivers twice first simply
+     * overwrites its own values (newest wins), so a pair is the latest sample
+     * of each part, up to one ODR period apart - as it was before.
+     * ASSUMPTION: Zyxda clears once LIS2MDL_ReadXYZ has read the sample.
+     * DS12144 Rev 6 section 8.12 does not state the clear condition; the
+     * brief-HAL_BUSY behaviour this firmware has always seen implies it. If it
+     * did not clear, a pair would be produced on every pass instead of at the
+     * ODR - visible as ~1 ms steps in the SD 'ms' column. */
+    static uint8_t s1_new = 0U, s2_new = 0U;
+    if (s1 == HAL_OK) { s1_new = 1U; }
+    if (s2 == HAL_OK) { s2_new = 1U; }
+
+    if ((s1_new != 0U) && (s2_new != 0U))
     {
       uint32_t now_ms = HAL_GetTick();
+
+      s1_new = 0U;
+      s2_new = 0U;
 
       /* P2PS_APP_SetMagSample() has moved below, after the zeroed delta is
        * computed - it now carries z_x,z_y,z_z as well and cannot run before
@@ -564,6 +638,13 @@ int main(void)
       P2PS_APP_SetMagSample((int16_t)x1, (int16_t)sensor1_y, (int16_t)z1,
                             (int16_t)x2, (int16_t)y2, (int16_t)z2,
                             z_x, z_y, z_z, MagZero_IsReady());
+      /* Send now, before the CDC print and SD work below, so a slow SD block
+       * write or puff logging later in this pass does not delay the
+       * notification. Main thread only: the ACI call waits for CPU2 through
+       * the sequencer, so it must never be called from an ISR. If the send is
+       * deferred (CPU2 TX pool full, a pending puff packet, or the min-gap
+       * guard) the pair stays pending and the end-of-loop call retries it. */
+      P2PS_APP_Process();
 
       // Case-switch for streaming over USB or BLE
       switch (serial_stream_mode)
@@ -629,23 +710,30 @@ int main(void)
                           z_x, z_y, z_z, z_mag);
       }
     }
-    else if ((HAL_GetTick() - usb_status_last_ms) >= 1000U) // if either sensor isn't reading
-        {
-          char usb_line[96];
-          int usb_len = snprintf(usb_line, sizeof(usb_line),
-                 "LIS2MDL read status: sensor1=%ld sensor2=%ld\r\n",
-                 (long)s1, (long)s2);
-          if ((usb_len > 0) && ((size_t)usb_len < sizeof(usb_line)))
-          {
-            (void)USB_CDC_Print(usb_line);
-          }
-          usb_status_last_ms = HAL_GetTick();
-        }
+
+    /* Report a sensor that is not reading, at most once per second. Plain
+     * HAL_BUSY between samples is not a fault and is not reported. */
+    if ((mag_read_fault != 0U) && ((HAL_GetTick() - usb_status_last_ms) >= 1000U))
+    {
+      char usb_line[96];
+      int usb_len = snprintf(usb_line, sizeof(usb_line),
+             "LIS2MDL read status: sensor1=%ld sensor2=%ld\r\n",
+             (long)s1, (long)s2);
+      if ((usb_len > 0) && ((size_t)usb_len < sizeof(usb_line)))
+      {
+        (void)USB_CDC_Print(usb_line);
+      }
+      usb_status_last_ms = HAL_GetTick();
+    }
 
     PuffLogService(); //monitor and watch for puffs
     SDLog_Service(); //log if there's anything to log
-    P2PS_APP_Process(); // notify latest sample over BLE if subscribed.
-    HAL_Delay(50);
+    P2PS_APP_Process(); // retry a pair the in-block send deferred; returns at once if nothing is pending.
+    /* No delay here. The loop free-runs: sensor pacing comes from the LIS2MDL
+     * data-ready flag and the pairing above, BLE sends once per new pair, and
+     * everything else (SD sync, USB restore, status prints) is HAL_GetTick()
+     * timed. A delay here only drops sensor samples and adds latency to CDC
+     * commands, the puff queue and the BLE sequencer. */
   }
   /* USER CODE END 3 */
 }
@@ -1084,7 +1172,58 @@ static void MX_TIM2_Init(void)
   }
 
   /* USER CODE BEGIN TIM2_Init 2 */
+  /* PWM-input configuration, re-applied inside this fence so it survives
+   * CubeMX regeneration, which would otherwise overwrite the generated block
+   * above with a plain input capture. Everything below depends on the slave
+   * reset: without it CNT never restarts on an edge, CCR1/CCR2 stop being
+   * period/high time, and the CH3 compare no longer means "no edge for
+   * RF_END_TIMEOUT_US".
+   * RM0434 Rev 16 §28.3.6 (PWM input mode procedure), §28.3.18 (reset mode).
+   * The channels are not enabled yet (CCxE is set later by HAL_TIM_IC_Start*),
+   * so reconfiguring them here is safe. */
+  {
+    TIM_SlaveConfigTypeDef pwmSlave = {0};
+    TIM_IC_InitTypeDef pwmIC = {0};
 
+    /* SMCR: SMS = 0100 (reset mode), TS = 00101 (TI1FP1). HAL also programs
+     * TI1 polarity/filter here: CC1P = 0, CC1NP = 0 (rising), IC1F = 0000. */
+    pwmSlave.SlaveMode = TIM_SLAVEMODE_RESET;
+    pwmSlave.InputTrigger = TIM_TS_TI1FP1;
+    pwmSlave.TriggerPolarity = TIM_TRIGGERPOLARITY_RISING;
+    pwmSlave.TriggerFilter = 0;
+    if (HAL_TIM_SlaveConfigSynchro(&htim2, &pwmSlave) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    /* CH1: CC1S = 01 (IC1 on TI1), rising -> CCR1 = period. */
+    pwmIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+    pwmIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+    pwmIC.ICPrescaler = TIM_ICPSC_DIV1;
+    pwmIC.ICFilter = 0;
+    if (HAL_TIM_IC_ConfigChannel(&htim2, &pwmIC, TIM_CHANNEL_1) != HAL_OK)
+    {
+      Error_Handler();
+    }
+
+    /* CH2: CC2S = 10 (IC2 on TI1), CC2P = 1 / CC2NP = 0 (falling) -> CCR2 = high time. */
+    pwmIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_FALLING;
+    pwmIC.ICSelection = TIM_ICSELECTION_INDIRECTTI;
+    if (HAL_TIM_IC_ConfigChannel(&htim2, &pwmIC, TIM_CHANNEL_2) != HAL_OK)
+    {
+      Error_Handler();
+    }
+  }
+
+  /* End-of-signal detection on CH3: output compare in frozen mode, no pin.
+   * The counter restarts at every rising edge (slave reset mode), so CNT
+   * reaching CCR3 means no edge for RF_END_TIMEOUT_US. The CC3 interrupt is
+   * enabled only while a puff is active. APB1 is not divided, so the TIM2
+   * clock equals PCLK1. */
+  rf_ticks_per_us = HAL_RCC_GetPCLK1Freq() / 1000000U;
+  rf_end_timeout_ticks = RF_END_TIMEOUT_US * rf_ticks_per_us;
+  TIM2->CCMR2 &= ~(TIM_CCMR2_CC3S | TIM_CCMR2_OC3M | TIM_CCMR2_OC3PE);
+  TIM2->CCR3 = rf_end_timeout_ticks;
   /* USER CODE END TIM2_Init 2 */
 
 }
@@ -1184,23 +1323,54 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 
     uint32_t now_ms = HAL_GetTick();
 
-    if ((TIM2->SR & TIM_SR_CC1OF) != 0U)
-    {
-    	rf_overcapture++;
-    	TIM2->SR = ~TIM_SR_CC1OF; // rc_w0, writing 0 clears
-    }
-
     /*
      * PWM input mode. The rising edge on TI1 resets the counter, so CCR1
      * holds the full period of the cycle that just ended and CCR2 holds that
-     * same cycle's high time.
+     * same cycle's high time. Read the data before any flag
+     * (RM0434 Rev 16 §28.3.5).
      */
     uint32_t period = TIM2->CCR1;
     uint32_t high = TIM2->CCR2;
 
     last_capture = period;
 
-    if (rf_meas_state >= 2U)
+    /* The previous puff already timed out, and this edge starts a new one.
+     * Two independent checks:
+     *  - CC3IF set: the CH3 match happened but its dispatch has not run yet.
+     *  - period >= CCR3: the gap before this edge was at least the timeout.
+     *    This also covers the case where HAL sampled SR before this edge,
+     *    dispatched CC3, cleared CC3IF, and the compare callback then saw CNT
+     *    already reset by this edge and did nothing. */
+    if ((puff_active != 0U) &&
+        (((TIM2->SR & TIM_SR_CC3IF) != 0U) || (period >= rf_end_timeout_ticks)))
+    {
+    	RF_PuffEnd();
+    }
+
+    uint8_t first_edge = 0U;
+    if (puff_active == 0U)
+    {
+    	/* First edge of a puff. Its CCR1 spans the idle gap, so it only
+    	 * starts the clock; duration and statistics start at the next edge. */
+    	RF_PuffStart(now_ms);
+    	first_edge = 1U;
+    }
+    else
+    {
+    	/* Sum of periods = time from the first rising edge to this one. */
+    	rf_dur_ticks += period;
+    }
+
+    if ((TIM2->SR & TIM_SR_CC1OF) != 0U)
+    {
+    	if (first_edge == 0U)
+    	{
+    		rf_overcapture++;  /* a capture was missed: that period is not in the duration */
+    	}
+    	TIM2->SR = ~TIM_SR_CC1OF; // rc_w0, writing 0 clears
+    }
+
+    if ((first_edge == 0U) && (rf_meas_state >= 2U))
     {
     	if (period < rf_per_min) { rf_per_min = period; }
     	if (period > rf_per_max) { rf_per_max = period; }
@@ -1239,12 +1409,6 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 
     }
 
-    else if (rf_meas_state == 1U)
-    {
-    	rf_meas_state = 2U; // discard the first cycle, it spans the idle gap
-    }
-
-    last_rf_edge_ms = now_ms;
     rf_edge_count++;
     rf_falling_count++;
 
@@ -1253,17 +1417,105 @@ void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
            uint32_t lat = TIM2->CNT;
            if (lat > rf_latency_max) { rf_latency_max = lat; }
      }
+}
 
-
-    /*
-     * Do not perform USB or SD operations here.
-     * Tell the main loop that it needs to begin a puff.
-     */
-    if ((puff_active == 0U) && (puff_started == 0U))
+/* TIM2 CH3 compare: no rising edge for RF_END_TIMEOUT_US, the RF signal is gone. */
+void HAL_TIM_OC_DelayElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if ((htim->Instance != TIM2) ||
+        (htim->Channel != HAL_TIM_ACTIVE_CHANNEL_3))
     {
-        puff_start_ms = now_ms;
-        puff_started = 1U;
+        return;
     }
+
+    /* HAL samples SR and DIER once per interrupt, so this can run for a match
+     * the capture callback has already handled (and a new puff may have
+     * started since). A genuine timeout has CNT at or past CCR3. If an edge
+     * reset CNT between HAL's SR read and this check, the timeout is skipped
+     * here and the capture callback ends the puff on that edge instead
+     * (period >= CCR3). */
+    if ((puff_active != 0U) && (TIM2->CNT >= rf_end_timeout_ticks))
+    {
+        RF_PuffEnd();
+    }
+}
+
+/* ISR context. Do not perform USB or SD operations here. */
+static void RF_PuffStart(uint32_t now_ms)
+{
+    current_puff_id++;
+    rf_puff_id = current_puff_id;  /* START, END and MAG rows all use this, not the counter */
+    rf_puff_start_ms = now_ms;
+    rf_dur_ticks = 0U;
+
+    rf_puff_start_edges = rf_edge_count;
+    rf_puff_start_rising = rf_rising_count;
+    rf_puff_start_falling = rf_falling_count;
+
+    rf_per_min = 0xFFFFFFFFU;
+    rf_per_max = 0U;
+    rf_gap_count = 0U;
+    rf_duty_min = 0xFFFFFFFFU;
+    rf_duty_max = 0U;
+    rf_duty_cross = 0U;
+    rf_duty_state = 0U;
+    rf_overcapture = 0U;
+    rf_latency_max = 0U;
+    rf_meas_state = 2U;  /* next capture is the first full signal cycle */
+
+    puff_active = 1U;
+    LED_PuffOn();
+
+    /* This edge has just reset CNT to 0: arm the end-of-signal compare. */
+    __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_CC3);
+    __HAL_TIM_ENABLE_IT(&htim2, TIM_IT_CC3);
+
+    RF_QueuePush(RF_EVT_START);
+}
+
+/* ISR context. Do not perform USB or SD operations here. */
+static void RF_PuffEnd(void)
+{
+    __HAL_TIM_DISABLE_IT(&htim2, TIM_IT_CC3);
+    __HAL_TIM_CLEAR_FLAG(&htim2, TIM_FLAG_CC3);
+
+    RF_QueuePush(RF_EVT_END);
+
+    rf_meas_state = 0U;
+    puff_active = 0U;
+    LED_AllOff();
+}
+
+/* ISR context: snapshot the current puff into the event queue. */
+static void RF_QueuePush(uint8_t type)
+{
+    uint32_t head = rf_evt_head;
+
+    if ((head - rf_evt_tail) >= RF_EVT_QUEUE_LEN)
+    {
+        rf_evt_dropped++;
+        return;
+    }
+
+    RfPuffEvent *ev = &rf_evt_queue[head % RF_EVT_QUEUE_LEN];
+    ev->type = type;
+    ev->puff_id = rf_puff_id;
+    ev->start_ms = rf_puff_start_ms;
+    ev->duration_ticks = rf_dur_ticks;
+    ev->edges = rf_edge_count - rf_puff_start_edges;
+    ev->rising = rf_rising_count - rf_puff_start_rising;
+    ev->falling = rf_falling_count - rf_puff_start_falling;
+    ev->per_min = rf_per_min;
+    ev->per_max = rf_per_max;
+    ev->gap_count = rf_gap_count;
+    ev->duty_min = rf_duty_min;
+    ev->duty_max = rf_duty_max;
+    ev->duty_cross = rf_duty_cross;
+    ev->overcapture = rf_overcapture;
+    ev->latency_max = rf_latency_max;
+
+    __DMB();  /* event contents visible before the new head */
+    rf_evt_head = head + 1U;
 }
 
 static void CS1_Select(void)   { HAL_GPIO_WritePin(MAG_CS2_GPIO_Port, MAG_CS2_Pin, GPIO_PIN_SET); HAL_GPIO_WritePin(MAG_CS1_GPIO_Port, MAG_CS1_Pin, GPIO_PIN_RESET); }
@@ -1337,10 +1589,10 @@ static void SDLog_ProcessCommand(void)
          * with a target already near it, since the boot capture would have
          * absorbed that target into the reference.
          * Duration is deliberately not quoted: the capture needs
-         * MAG_ZERO_DISCARD + MAG_ZERO_SAMPLES samples that both parts returned
-         * HAL_OK for, and this loop polls at the same 20 Hz as the ODR, so it
-         * misses samples at an unpredictable rate. Wait for the confirmation
-         * line instead of a stopwatch. */
+         * MAG_ZERO_DISCARD + MAG_ZERO_SAMPLES s1/s2 pairs, which arrive at
+         * roughly the 20 Hz ODR but not at a guaranteed rate (the two parts
+         * free-run on separate clocks, and a slow SD block write can delay a
+         * pass). Wait for the confirmation line instead of a stopwatch. */
         MagZero_Arm();
         mag_zero_announced = 0U;
         if (sd_logging != 0U) {
@@ -1464,7 +1716,7 @@ static void SDLog_Start(void)
     char message[128];
 
     // Declare headers for puff events and magnetometer readings
-    static const char puff_header[] = "date,time,puff_id,event,start_ms,end_ms,duration_ms,rf_edges,rising_edges,falling_edges,thermistor1,thermistor2\r\n";
+    static const char puff_header[] = "date,time,puff_id,event,start_ms,end_ms,duration_ms,rf_edges,rising_edges,falling_edges,thermistor1,thermistor2,duration_us\r\n";
     static const char mag_header[] = "date,time,ms,puff_id,puff_active,s1_x,s1_y,s1_z,s1_mag,s2_x,s2_y,s2_z,s2_mag,z_x,z_y,z_z,z_mag\r\n";
 
     if (sd_logging != 0U) {
@@ -1536,7 +1788,20 @@ static void SDLog_Start(void)
     	return;
     }
     // set all related flags to false and ready double buffer
-    current_puff_id = 0U;
+    /* Restart puff numbering for the new run. The TIM2 ISR writes both IDs,
+     * so update them with interrupts masked (a few instructions). A puff
+     * already in progress keeps its ID for its END row and its MAG rows;
+     * the next puff of this run is 1. */
+    {
+        uint32_t primask = __get_PRIMASK();
+        __disable_irq();
+        current_puff_id = 0U;
+        if (puff_active == 0U)
+        {
+            rf_puff_id = 0U;
+        }
+        __set_PRIMASK(primask);
+    }
     mag_fill_buf = mag_buffer1;
     mag_write_buf = mag_buffer2;
     mag_fill_count = 0U;
@@ -1727,7 +1992,7 @@ static void SDLog_WriteSample(uint32_t now_ms,
 	MagLogSample *sample = &mag_fill_buf[mag_fill_count++];
 	getTimestamp(sample->timestamp, sizeof(sample->timestamp));
 	sample->ms = now_ms;
-	sample->puff_id = current_puff_id;
+	sample->puff_id = rf_puff_id;
 	sample->puff_active = puff_active;
 	sample->s1_x = s1_x;
 	sample->s1_y = s1_y;
@@ -1832,7 +2097,7 @@ static void SDLog_FlushMagBuffers(void)
 	}
 }
 
-static void SDLog_WritePuffEvent(const char *event, uint32_t start_ms, uint32_t end_ms, uint32_t duration_ms, uint32_t edges, uint32_t rising, uint32_t falling, uint32_t t1_raw, uint32_t t2_raw)
+static void SDLog_WritePuffEvent(uint32_t puff_id, const char *event, uint32_t start_ms, uint32_t end_ms, uint32_t duration_ms, uint32_t edges, uint32_t rising, uint32_t falling, uint32_t t1_raw, uint32_t t2_raw, uint32_t duration_us)
 {
 	if (sd_logging == 0U)
 	{
@@ -1843,8 +2108,8 @@ static void SDLog_WritePuffEvent(const char *event, uint32_t start_ms, uint32_t 
 	char line[192];
 	getTimestamp(timestamp, sizeof(timestamp));
 
-	int len = snprintf(line, sizeof(line), "%s,%lu,%s,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n", timestamp,
-																				(unsigned long)current_puff_id,
+	int len = snprintf(line, sizeof(line), "%s,%lu,%s,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n", timestamp,
+																				(unsigned long)puff_id,
 																				event,
 																				(unsigned long)start_ms,
 																				(unsigned long)end_ms,
@@ -1853,7 +2118,8 @@ static void SDLog_WritePuffEvent(const char *event, uint32_t start_ms, uint32_t 
 																				(unsigned long)rising,
 																				(unsigned long)falling,
 																				(unsigned long)t1_raw,
-																				(unsigned long)t2_raw);
+																				(unsigned long)t2_raw,
+			(unsigned long)duration_us);
 	if ((len <= 0) || ((size_t)len >= sizeof(line)))
 	{
 		SDLog_Abort("PUFF line format failed", FR_INT_ERR);
@@ -1873,72 +2139,54 @@ static void SDLog_WritePuffEvent(const char *event, uint32_t start_ms, uint32_t 
 
 static void PuffLogService(void)
 {
-
     /*
-     * The ISR sets puff_started.
-     * The main loop performs printing and SD writes.
+     * Puff start and end are decided in the TIM2 interrupt, which also drives
+     * the LED. The slow work (CDC print, thermistors, SD rows) happens here.
      */
-    if ((puff_started != 0U) && (puff_active == 0U))
+    while (rf_evt_tail != rf_evt_head)
     {
+        __DMB();  /* read the event after seeing the new head */
+        RfPuffEvent ev = rf_evt_queue[rf_evt_tail % RF_EVT_QUEUE_LEN];
+        __DMB();  /* finish the copy before releasing the slot to the ISR;
+                   * also a compiler barrier, so the copy cannot sink below
+                   * the volatile tail store */
+        rf_evt_tail = rf_evt_tail + 1U;
 
-        start_puff();
-        puff_started = 0U; // IMPORTANT: Clear this flag AFTER start_puff returns in order to avoid re-arming the flag and leave stale puff_start_ms behind
+        if (ev.type == RF_EVT_START)
+        {
+            Puff_LogStart(&ev);
+        }
+        else
+        {
+            Puff_LogEnd(&ev);
+        }
     }
 
-    // Read ticks HERE, not at the top of the function.
-    // Doing this
-    uint32_t last_ms = last_rf_edge_ms;
-    uint32_t now_ms = HAL_GetTick();
-    uint32_t idle_ms = now_ms - last_ms;
-
-    if (idle_ms > 0x7FFFFFFFU)
+    static uint32_t dropped_reported = 0U;
+    uint32_t dropped = rf_evt_dropped;
+    if (dropped != dropped_reported)
     {
-    	idle_ms = 0U; // edge landed after the tick was sampled
-    }
-
-    /* if puff active, GPIO15 high and time since last edge is greater than the timeout period, end the puff*/
-    if ((puff_active != 0U) &&
-        (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_15) == GPIO_PIN_SET) &&
-        ((idle_ms >= RF_INACTIVITY_TIMEOUT_MS)))
-    {
-        end_puff();
+        char message[80];
+        int len = snprintf(message, sizeof(message),
+                           "Warning: %lu puff events dropped (queue full)\r\n",
+                           (unsigned long)(dropped - dropped_reported));
+        if ((len > 0) && ((size_t)len < sizeof(message)))
+        {
+            (void)USB_CDC_Print(message);
+        }
+        dropped_reported = dropped;
     }
 }
 
-static void start_puff(void)
+static void Puff_LogStart(const RfPuffEvent *ev)
 {
-    current_puff_id++;
-
-    puff_active = 1U;
-    puff_ended = 0U;
-
-    rf_per_min = 0xFFFFFFFFU;
-    rf_per_max = 0U;
-    rf_gap_count = 0U;
-    rf_duty_min = 0xFFFFFFFFU;
-    rf_duty_max = 0U;
-    rf_duty_cross = 0U;
-    rf_duty_state = 0U;
-    rf_overcapture = 0U;
-    rf_latency_max = 0U;
-    rf_meas_state = 1U;
-
-
-    /*
-     * puff_start_ms was recorded by the ISR at the first edge.
-     */
-    puff_start_edge_count = rf_edge_count;
-    puff_start_rising_count = rf_rising_count;
-    puff_start_falling_count = rf_falling_count;
-
-    LED_PuffOn();
     char message[96];
     int len = snprintf(
         message,
         sizeof(message),
         "PUFF %lu START at %lu ms\r\n",
-        (unsigned long)current_puff_id,
-        (unsigned long)puff_start_ms);
+        (unsigned long)ev->puff_id,
+        (unsigned long)ev->start_ms);
 
     if ((len > 0) && ((size_t)len < sizeof(message)))
     {
@@ -1948,94 +2196,85 @@ static void start_puff(void)
     Thermistor_ReadBoth(&therm1_start, &therm2_start);
 
     SDLog_WritePuffEvent(
+        ev->puff_id,
         "START",
-        puff_start_ms,
+        ev->start_ms,
         0U,
         0U,
         0U,
         0U,
         0U,
-		therm1_start,
-		therm2_start);
+        therm1_start,
+        therm2_start,
+        0U);
 }
 
-static void end_puff(void)
+static void Puff_LogEnd(const RfPuffEvent *ev)
 {
-    /*
-     * Use the last actual RF transition as the signal endpoint.
-     */
-    puff_end_ms = last_rf_edge_ms;
-    puff_duration_ms = puff_end_ms - puff_start_ms;
-
-    uint32_t edges = rf_edge_count - puff_start_edge_count;
-    uint32_t rising = rf_rising_count - puff_start_rising_count;
-    uint32_t falling = rf_falling_count - puff_start_falling_count;
-
-    puff_ended = 1U;
-    LED_AllOff();
+    /* Measured by TIM2: first rising edge to last rising edge. */
+    uint32_t duration_us = (uint32_t)(ev->duration_ticks / rf_ticks_per_us);
+    uint32_t duration_ms = duration_us / 1000U;
+    uint32_t end_ms = ev->start_ms + duration_ms;
 
     /* Writing for both CDC and SD Logging */
     char message[128];
     int len = snprintf(
         message,
         sizeof(message),
-        "PUFF %lu END duration=%lu ms edges=%lu rise=%lu fall=%lu\r\n",
-        (unsigned long)current_puff_id,
-        (unsigned long)puff_duration_ms,
-        (unsigned long)edges,
-        (unsigned long)rising,
-        (unsigned long)falling);
+        "PUFF %lu END duration=%lu us edges=%lu rise=%lu fall=%lu\r\n",
+        (unsigned long)ev->puff_id,
+        (unsigned long)duration_us,
+        (unsigned long)ev->edges,
+        (unsigned long)ev->rising,
+        (unsigned long)ev->falling);
 
     if ((len > 0) && ((size_t)len < sizeof(message)))
     {
         (void)USB_CDC_Print(message);
     }
 
-    rf_meas_state = 0U;
-
-    if (rf_per_max != 0U)
+    if (ev->per_max != 0U)
     {
         char line[256];
-        uint32_t spread = (rf_duty_max >= rf_duty_min)
-                          ? (rf_duty_max - rf_duty_min) : 0U;
+        uint32_t tpu = rf_ticks_per_us;
+        uint32_t spread = (ev->duty_max >= ev->duty_min)
+                          ? (ev->duty_max - ev->duty_min) : 0U;
         /* two crossings per modulation cycle */
-        uint32_t mod_hz = (puff_duration_ms > 0U)
-                          ? ((rf_duty_cross * 500UL) / puff_duration_ms) : 0UL;
+        uint32_t mod_hz = (duration_us > 0U)
+                          ? (uint32_t)(((uint64_t)ev->duty_cross * 500000ULL) / duration_us) : 0UL;
 
         int n = snprintf(line, sizeof(line),
             "PUFF %lu PWM per=%lu..%lu (%lu.%lu..%lu.%lu us) duty=%lu..%lu pm spread=%lu long=%lu cross=%lu (%lu Hz) ovf=%lu lat=%lu\r\n",
-            (unsigned long)current_puff_id,
-            (unsigned long)rf_per_min,
-            (unsigned long)rf_per_max,
-            (unsigned long)(rf_per_min / 64U), (unsigned long)((rf_per_min * 10U / 64U) % 10U),
-            (unsigned long)(rf_per_max / 64U), (unsigned long)((rf_per_max * 10U / 64U) % 10U),
-            (unsigned long)rf_duty_min,
-            (unsigned long)rf_duty_max,
+            (unsigned long)ev->puff_id,
+            (unsigned long)ev->per_min,
+            (unsigned long)ev->per_max,
+            (unsigned long)(ev->per_min / tpu), (unsigned long)((ev->per_min * 10U / tpu) % 10U),
+            (unsigned long)(ev->per_max / tpu), (unsigned long)((ev->per_max * 10U / tpu) % 10U),
+            (unsigned long)ev->duty_min,
+            (unsigned long)ev->duty_max,
             (unsigned long)spread,
-            (unsigned long)rf_gap_count,
-            (unsigned long)rf_duty_cross,
+            (unsigned long)ev->gap_count,
+            (unsigned long)ev->duty_cross,
             (unsigned long)mod_hz,
-            (unsigned long)rf_overcapture,
-            (unsigned long)rf_latency_max);
+            (unsigned long)ev->overcapture,
+            (unsigned long)ev->latency_max);
         if ((n > 0) && ((size_t)n < sizeof(line))) { (void)USB_CDC_Print(line); }
     }
-
 
     Thermistor_ReadBoth(&therm1_end, &therm2_end); // read both end values
 
     SDLog_WritePuffEvent(
+        ev->puff_id,
         "END",
-        puff_start_ms,
-        puff_end_ms,
-        puff_duration_ms,
-        edges,
-        rising,
-        falling,
-		therm1_end,
-		therm2_end);
-
-    // puff active cleared at END after all I/O so that edges arriving during SD write cannot arm the next puff
-    puff_active = 0U;
+        ev->start_ms,
+        end_ms,
+        duration_ms,
+        ev->edges,
+        ev->rising,
+        ev->falling,
+        therm1_end,
+        therm2_end,
+        duration_us);
 }
 
 // Thermistor Functions

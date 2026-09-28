@@ -39,8 +39,12 @@
 
 /* Private defines ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-// Notification period. 1000 = 1Hz for bring up, drop to 50 for 20 Hz (one notification per magnetomenter sample)
-#define P2PS_APP_NOTIFY_PERIOD_MS 50U
+/* One mag notification is sent per new s1/s2 pair (see P2PS_APP_Process), so
+ * the notify rate follows the LIS2MDL ODR (20 Hz) rather than a timer. This is
+ * only a minimum spacing between mag notifications, a guard against flooding
+ * CPU2's TX pool if pairs ever arrive faster than expected. 25 ms is half the
+ * 20 Hz sample period, so it never throttles normal operation. */
+#define P2PS_APP_NOTIFY_MIN_GAP_MS 25U
 /* USER CODE END PD */
 
 /* Private macros -------------------------------------------------------------*/
@@ -88,7 +92,7 @@ typedef struct __attribute__((packed))
     uint32_t start_ms;
     uint16_t duration_ms;
     uint16_t mod_hz;         /* duty-cycle modulation, 0 if none */
-    uint16_t carrier_hz;     /* edges/s, ~20000 if a converter is present */
+    uint16_t carrier_hz;     /* RF edges per second during the puff */
     uint16_t therm1_raw;
     uint16_t therm2_raw;
     uint16_t reserved;
@@ -114,6 +118,9 @@ typedef char BlePuffPacket_size_must_match_notify_len[
 ];
 
 static BleMagPacket latest_sample;
+/* Set by P2PS_APP_SetMagSample() when a new pair arrives, cleared once it has
+ * been notified successfully (or on disconnect). Each pair goes out at most
+ * once, so a free-running main loop cannot resend a stale sample. */
 static uint8_t latest_sample_valid = 0U;
 /* USER CODE END PV */
 
@@ -231,20 +238,23 @@ void P2PS_APP_Process(void)
         return;   /* one notification per pass; mag sample goes next time */
     }
 
-    if (latest_sample_valid == 0U) { return; }
-    if ((uint32_t)(now_ms - last_send_ms) < P2PS_APP_NOTIFY_PERIOD_MS) { return; }
+    if (latest_sample_valid == 0U) { return; }   /* nothing new since the last send */
+    if ((uint32_t)(now_ms - last_send_ms) < P2PS_APP_NOTIFY_MIN_GAP_MS) { return; }
 
   latest_sample.sequence = sequence;
 
 	tBleStatus status = P2PS_STM_App_Update_Char(P2P_NOTIFY_CHAR_UUID, (uint8_t *)&latest_sample);
 
 	if (status == BLE_STATUS_SUCCESS)
-  // Advance only on success. If CPU2's TX pool was full, we leave
-  // last_send_ms alone so the next loop pass retries immediately
-  // instead of dropping the sample.
+  // Advance only on success. If CPU2's TX pool was full, the pair stays
+  // pending and the next loop pass retries it. If a
+  // newer pair arrives first it replaces this one; sequence is unchanged,
+  // so the host cannot see that from sequence alone, only from
+  // timestamp_ms.
 	{
 		sequence++;
     last_send_ms = now_ms;
+    latest_sample_valid = 0U;
 	}
 }
 
